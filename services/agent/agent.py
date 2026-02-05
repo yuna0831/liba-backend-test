@@ -1,16 +1,17 @@
-import asyncio
-import os
 import logging
+import os
+import ssl
+import certifi
+import aiohttp
+import asyncio
+from pathlib import Path
+
 from dotenv import load_dotenv
-from livekit import api, rtc
+from livekit.agents import JobContext, WorkerOptions, cli
+from livekit.plugins import tavus
 
 # Load environment variables
-load_dotenv()
-
-LIVEKIT_URL = os.getenv("LIVEKIT_URL")
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
-DEFAULT_ROOM = os.getenv("DEFAULT_ROOM", "demo")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 # Configure logging
 logging.basicConfig(
@@ -19,49 +20,71 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
-async def main():
-    logger.info("Starting Agent Service...")
+TAVUS_PERSONA_ID = os.getenv("TAVUS_PERSONA_ID")
+TAVUS_REPLICA_ID = os.getenv("TAVUS_REPLICA_ID") # Optional
 
-    if not all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]):
-        logger.error("Missing required environment variables (LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)")
+class MinimalOutput:
+    def __init__(self):
+        self.audio = None
+
+class MinimalAgentSession:
+    """
+    A minimal wrapper around JobContext to satisfy livekit-plugins-tavus
+    which expects an AgentSession object with an 'output' attribute.
+    """
+    def __init__(self, ctx: JobContext):
+        self.ctx = ctx
+        self.output = MinimalOutput()
+        # Proxy other attributes to ctx if needed
+        
+    @property
+    def room(self):
+        return self.ctx.room
+
+async def entrypoint(ctx: JobContext):
+    """
+    Entrypoint for the LiveKit Agent.
+    """
+    await ctx.connect()
+    logger.info(f"Agent connected to room: {ctx.room.name}")
+
+    if not TAVUS_PERSONA_ID:
+        logger.error("TAVUS_PERSONA_ID is not set. Cannot start Tavus agent.")
+        return
+    if not TAVUS_REPLICA_ID:
+        logger.error("TAVUS_REPLICA_ID is not set. Cannot start Tavus avatar session.")
         return
 
-    # 1. Create a token for the agent
-    logger.info(f"Generating token for identity: avatar-bot in room: {DEFAULT_ROOM}")
-    token = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
-        .with_identity("avatar-bot") \
-        .with_name("Avatar Bot") \
-        .with_grants(api.VideoGrants(room_join=True, room=DEFAULT_ROOM))
-    
-    jwt_token = token.to_jwt()
-
-    # 2. Connect to the room
-    room = rtc.Room()
-
-    @room.on("connected")
-    def on_connected():
-        logger.info("Events: Agent successfully connected to the room!")
-
-    @room.on("disconnected")
-    def on_disconnected(reason=None):
-        logger.info(f"Events: Agent disconnected. Reason: {reason}")
-
-    logger.info(f"Connecting to LiveKit server at {LIVEKIT_URL}...")
-    
     try:
-        await room.connect(LIVEKIT_URL, jwt_token)
-        logger.info(f"Agent joined room '{DEFAULT_ROOM}'")
+        logger.info(f"Starting avatar session for Persona: {TAVUS_PERSONA_ID} (replica: {TAVUS_REPLICA_ID})...")
+
+        avatar = tavus.AvatarSession(
+            persona_id=TAVUS_PERSONA_ID,
+            replica_id=TAVUS_REPLICA_ID,
+        )
+
+        # Use the wrapper to satisfy the plugin interface
+        session_wrapper = MinimalAgentSession(ctx)
         
-        # 3. Keep the process alive
-        # In a real agent, we would handle events here (listening to tracks, etc.)
-        # For Step 2, we just stay connected.
-        while True:
-            await asyncio.sleep(1)
-            
+        await avatar.start(session_wrapper, room=ctx.room)
+        
+        logger.info("Avatar started successfully.")
+
+        # keep running until job is cancelled
+        await asyncio.Future()
+
+    except asyncio.CancelledError:
+        logger.info("Agent task cancelled")
     except Exception as e:
-        logger.error(f"Failed to connect: {e}")
-    finally:
-        await room.disconnect()
+        logger.exception(f"Failed to start Tavus Avatar: {e}")
+        await asyncio.sleep(5)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Fix SSL usage globally for requests/other libs just in case
+    os.environ['SSL_CERT_FILE'] = certifi.where()
+
+    cli.run_app(WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        agent_name="avatar-bot",
+    ))

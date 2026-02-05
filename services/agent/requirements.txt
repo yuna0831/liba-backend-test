@@ -2,3 +2,5 @@ livekit-agents
 livekit-api
 python-dotenv
 livekit
+livekit-plugins-tavus
+certifi

@@ -83,7 +83,14 @@ export default function Home() {
     }
   };
 
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [lastSentText, setLastSentText] = useState('');
+
   const handleSpeak = async () => {
+    if (isSpeaking) return;
+    setIsSpeaking(true);
+    setLastSentText(speechText);
+
     try {
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/say`, {
         method: 'POST',
@@ -95,10 +102,16 @@ export default function Home() {
         const err = await response.json();
         throw new Error(err.detail || 'Failed to send speech');
       }
-      alert('Speech sent!');
+
+      // Reset after a delay (since we don't get a finished callback from API)
+      setTimeout(() => {
+        setIsSpeaking(false);
+      }, 3000);
+
     } catch (error) {
       console.error(error);
       alert('Failed to send speech');
+      setIsSpeaking(false);
     }
   };
 
@@ -150,13 +163,16 @@ export default function Home() {
           className="border p-2 rounded text-black"
           value={speechText}
           onChange={(e) => setSpeechText(e.target.value)}
+          disabled={isSpeaking}
         />
         <button
-          className="bg-purple-500 hover:bg-purple-600 text-white px-4 py-2 rounded"
+          className={`${isSpeaking ? 'bg-gray-400' : 'bg-purple-500 hover:bg-purple-600'} text-white px-4 py-2 rounded`}
           onClick={handleSpeak}
+          disabled={isSpeaking}
         >
-          Speak via Tavus
+          {isSpeaking ? 'Avatar is responding...' : 'Speak via Tavus'}
         </button>
+        {lastSentText && <p className="text-xs text-gray-500 mt-2">Last sent: "{lastSentText}"</p>}
       </div>
     </div>
   );

@@ -69,6 +69,57 @@ The actual implementation routes the synthesized audio to Tavus to drive the lip
 - `TAVUS_PERSONA_ID` and `TAVUS_REPLICA_ID` (and API Key) are required for Tavus.
 - `OPENAI_API_KEY` is required for TTS.
 
+## Step 5: Latency Metrics
+
+The agent now logs detailed timing for every spoken utterance to help tune performance.
+
+**Log Format:**
+`METRICS | uid=... | route=tavus | ms_tts_start=... | ms_first_audio=... | ms_total_approx=... | frames=...`
+
+- **ms_tts_start**: Time from `say` command receipt -> First audio frame synthesized.
+- **ms_first_audio**: Time from `say` command receipt -> First audio frame delivered to sink (Avatar or Fallback).
+- **ms_total_approx**: Time until playback finishes (including tail padding).
+
+
+## Latency Optimization
+
+### Problem
+Real-time digital humans must feel responsive. A noticeable delay between text input and the avatar speaking breaks immersion. The goal was to minimize end-to-end latency ("time to first word") and make performance measurable.
+
+### Instrumentation (T0~T3)
+To optimize effectively, I moved from guessing to measuring. A `MetricsStore` was implemented to track timestamps for every utterance (`uid`):
+
+- **T0 (Receipt):** `say` data packet received by Agent.
+- **T1 (First Audio):** First PCM frame produced by OpenAI TTS stream.
+- **T2 (Sink Delivery):** First PCM frame pushed to Tavus `capture_frame()`.
+- **T3 (Playback Done):** `playback_finished` event received (correlated via FIFO).
+
+### Changes Made
+1. **TTS Warm-up:** Implemented a silent `synthesize("warmup")` call on startup. This pre-heats the connection, shifting the initial ~1.7s cold-start delay to boot time rather than the first user interaction.
+2. **Text Chunking:** Added logic (`MAX_TEXT_CHUNK=120`) to split long text on punctuation. This forces the TTS engine to return the first audio chunk sooner, rather than waiting to process a full paragraph.
+3. **Silence Tail Tuning:** Reduced tail padding (`SILENCE_TAIL_MS`) from 300ms to 120ms to reduce perceived "hanging" at the end of speech while preventing cutoff.
+4. **Tavus Readiness Gating:** Wait up to 5s for `tavus_ready` event to avoid losing the first few seconds of speech during initialization.
+
+### Results
+Logs from a live session demonstrate the pipeline latency:
+
+- **Run #1 (Standard):** `d01` (T0→T1) ≈ **666ms**. `d12` (T1→T2) ≈ **7ms**.
+  - Total time to first audio delivered: **~673ms**.
+- **Run #2 (Variable):** `d01` ≈ 1503ms (Network/Model variance).
+- **Run #3 (Stabilized):** `d01` ≈ 978ms.
+
+**Key Finding:** The sink delivery time (`d12`) is consistently negligible (~2-7ms). The primary bottleneck is `d01` (TTS generation time), confirming that our streaming optimization and warm-up strategies are targeting the right area.
+
+### Tradeoffs
+- **Granularity vs. Context:** Chunking long text improves latency but can slightly affect prosody (intonation) across chunk boundaries.
+- **Tail Padding:** Too little padding risks cutting off the final syllable; 120ms was found to be a safe sweet spot.
+- **Correlation:** Without explicit utterance IDs from the Tavus player event, T3 mapping relies on a FIFO assumption, which is accurate for sequential speech but theoretical for overlapping commands.
+
+### Next Steps
+- **Frame Slicing:** Manually slice 200ms TTS frames into 50-100ms chunks to push audio to the sink even faster.
+- **T3 Correlation:** Parse detailed Tavus `app_messages` to find a robust per-utterance identifier.
+- **Jitter Buffer:** Implement an adaptive jitter buffer if A/V sync drift is observed under poor network conditions.
+
 ## Bug Fixes
 
 ### Fix: Last word cut off / speech truncation

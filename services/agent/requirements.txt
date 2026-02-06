@@ -4,3 +4,4 @@ python-dotenv
 livekit
 livekit-plugins-tavus
 certifi
+livekit-plugins-openai

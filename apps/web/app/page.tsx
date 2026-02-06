@@ -11,6 +11,7 @@ export default function Home() {
   const [wsUrl, setWsUrl] = useState('');
   const [status, setStatus] = useState('disconnected');
   const [participants, setParticipants] = useState(0);
+  const [speechText, setSpeechText] = useState('Hello, Tavus!');
   const roomRef = useRef<Room | null>(null);
 
   useEffect(() => {
@@ -82,6 +83,25 @@ export default function Home() {
     }
   };
 
+  const handleSpeak = async () => {
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/say`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ room: roomName, text: speechText }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.detail || 'Failed to send speech');
+      }
+      alert('Speech sent!');
+    } catch (error) {
+      console.error(error);
+      alert('Failed to send speech');
+    }
+  };
+
   return (
     <div className="flex flex-col items-center justify-center min-h-screen p-8 gap-4 font-[family-name:var(--font-geist-sans)]">
       <h1 className="text-2xl font-bold">Liba Backend Test</h1>
@@ -122,6 +142,21 @@ export default function Home() {
         <p><strong>Status:</strong> {status}</p>
         <p><strong>Participants:</strong> {participants}</p>
         <p className="break-all mt-2 text-xs text-gray-500"><strong>Token:</strong> {token ? token.slice(0, 20) + '...' : 'None'}</p>
+      </div>
+
+      <div className="mt-8 border p-4 rounded w-full max-w-md flex flex-col gap-2">
+        <h2 className="font-bold">Step 4: Speak</h2>
+        <textarea
+          className="border p-2 rounded text-black"
+          value={speechText}
+          onChange={(e) => setSpeechText(e.target.value)}
+        />
+        <button
+          className="bg-purple-500 hover:bg-purple-600 text-white px-4 py-2 rounded"
+          onClick={handleSpeak}
+        >
+          Speak via Tavus
+        </button>
       </div>
     </div>
   );

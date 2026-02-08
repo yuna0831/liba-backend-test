@@ -116,7 +116,7 @@ TAVUS_REPLICA_ID = os.getenv("TAVUS_REPLICA_ID")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # --- Tuning knobs ---
-TTS_WARMUP_TEXT = "warmup"
+TTS_WARMUP_PHRASES = ["h", "system ready"]  # 1st=connection, 2nd=inference
 SILENCE_TAIL_MS = 120   # 필요하면 80까지도 테스트
 MAX_TEXT_CHUNK = 120    # 너무 긴 텍스트면 문장 단위로 쪼개기
 DUP_SAY_WINDOW_SEC = 1.5  # 같은 say(같은 pid/job/room/text)가 1.5초 내 반복되면 드롭
@@ -204,17 +204,38 @@ async def publish_beep(ctx: JobContext):
         logger.exception(f"Failed to publish beep: {e}")
 
 
-async def warmup_tts(tts):
-    logger.info(f"🔥 Warming up TTS model with text: '{TTS_WARMUP_TEXT}'")
-    start = time.perf_counter()
-    try:
-        stream = tts.synthesize(TTS_WARMUP_TEXT)
-        async for _ in stream:
-            pass
-        duration = (time.perf_counter() - start) * 1000
-        logger.info(f"🔥 TTS Warmup Complete in {duration:.2f}ms")
-    except Exception as e:
-        logger.warning(f"TTS Warmup failed (non-fatal): {e}")
+async def robust_warmup_tts(tts, state_dict):
+    """
+    Multi-stage warmup:
+    1. Short phrase (network connection)
+    2. Longer phrase (inference context)
+    Runs in background; updates state_dict.
+    """
+    state_dict["status"] = "warming"
+    logger.info("🔥 Starting Multi-Stage TTS Warmup...")
+
+    for i, text in enumerate(TTS_WARMUP_PHRASES):
+        start = time.perf_counter()
+        try:
+            # Check if cancelled externally (though we run as task, explicit check helps)
+            if state_dict.get("cancelled"):
+                logger.info("TTS Warmup cancelled by user speech.")
+                return
+
+            logger.info(f"  - Warmup stage {i+1}/{len(TTS_WARMUP_PHRASES)}: '{text}'")
+            stream = tts.synthesize(text)
+            async for _ in stream:
+                pass # Consume stream to force processing
+            
+            dur = (time.perf_counter() - start) * 1000
+            logger.info(f"  - Warmup stage {i+1} complete: {dur:.2f}ms")
+            
+        except Exception as e:
+            logger.warning(f"  - Warmup stage {i+1} failed (non-fatal): {e}")
+
+    if not state_dict.get("cancelled"):
+        state_dict["status"] = "warm"
+        logger.info(f"🔥 TTS Warmup Finished (Ready). Total time: {(time.perf_counter()-state_dict['start_t'])*1000:.2f}ms")
 
 
 def split_text_for_latency(text: str, max_len: int = MAX_TEXT_CHUNK):
@@ -330,13 +351,17 @@ async def entrypoint(ctx: JobContext):
     def on_track_published(publication, participant):
         logger.info(f"Track published by {participant.identity}: {publication.sid} ({publication.kind})")
 
-    # 1) TTS init
+    # 1) TTS init & Warmup
     tts_plugin = None
+    tts_state = {"status": "cold", "start_t": time.perf_counter()}
+    warmup_task = None
+
     if OPENAI_API_KEY:
         try:
             logger.info("Initializing OpenAI TTS...")
             tts_plugin = openai.TTS(model="tts-1", voice="ash")
-            await warmup_tts(tts_plugin)
+            # Run warmup in background (non-blocking)
+            warmup_task = asyncio.create_task(robust_warmup_tts(tts_plugin, tts_state))
         except Exception as e:
             logger.error(f"Failed to init TTS: {e}")
 
@@ -381,6 +406,17 @@ async def entrypoint(ctx: JobContext):
             if not tts_plugin:
                 logger.warning(f"Cannot speak '{text}': TTS not initialized.")
                 return
+
+            # Cancel warmup if still running (Prioritize real user speech)
+            if warmup_task and not warmup_task.done():
+                logger.info("⚠️ User speech racing with Warmup! Cancelling warmup to free resources.")
+                tts_state["cancelled"] = True
+                warmup_task.cancel()
+                tts_state["status"] = "forced_warm"
+
+            # Log current TTS state for debugging variance
+            if tts_state["status"] != "warm":
+                logger.info(f"Speaking while TTS state is '{tts_state['status']}'")
 
             # Tavus 준비되기 전 첫 발화가 느려지는 케이스 방지
             try:

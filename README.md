@@ -120,6 +120,72 @@ Logs from a live session demonstrate the pipeline latency:
 - **T3 Correlation:** Parse detailed Tavus `app_messages` to find a robust per-utterance identifier.
 - **Jitter Buffer:** Implement an adaptive jitter buffer if A/V sync drift is observed under poor network conditions.
 
+## Architecture Deep Dive: TTS Latency Stabilization
+
+### Problem Statement
+In real-time conversational AI, **T0→T1 Latency** (Time from receipt of command to first audio packet) is the primary determinant of perceived responsiveness.
+Metrics collected from the prototype reveal high variance in this T0→T1 interval:
+- **Hot Path:** ~200-300ms (acceptable)
+- **Cold Path:** >1000ms (unacceptable degraded experience)
+
+This variance stems from the overhead of initiating new HTTPS connections (TLS handshakes) and model context loading during idle periods.
+
+### Stabilization Strategy
+To enforce consistent, low-variance performance, the system employs a robust **Multi-Stage Warmup Strategy** designed to prime both the network and inference layers. This goes beyond a simple "hello world" test.
+
+#### 1. Multi-Stage Warmup Sequence
+To avoid throttling and ensure complete readiness, warmup occurs in two non-blocking stages immediately upon agent initialization:
+- **Stage A (Network Priming):** A 1-token silent synthesis request is fired. This forces the opening of a persistent TCP/TLS connection to the OpenAI API, absorbing the ~100-200ms handshake penalty at boot time.
+- **Stage B (Inference Priming):** A short, phonetically balanced phrase ("System ready") is synthesized. This forces the inference engine to load weights and allocate context, moving the model from a "cold" to "hot" state.
+
+#### 2. Variance Reduction vs. Mean Latency
+This strategy primarily targets **Latency Variance (Jitter)** rather than mean reduction.
+- **Without Warmup:** The P99 latency includes full initialization costs.
+- **With Warmup:** The initialization cost is paid upfront. The P99 latency effectively becomes the P50 latency.
+**Perceived Result:** The system never feels "asleep" or "loading," maintaining the illusion of a constantly present digital human.
+
+#### 3. Defensive Execution
+Latency optimization must never compromise reliability. The warmup subsystem is designed defensively:
+- **Non-Blocking:** Warmup runs in a detached asynchronous task. The agent can accept user input immediately, even if warmup is still in progress (racing the warmup).
+- **Silent Failures:** If warmup fails (e.g., transient network issue), the error is logged but swallowed. The system gracefully degrades to "Cold Start" behavior for the first user turn, ensuring functionality is never blocked.
+
+
+## Reliability Improvements & Hardening
+
+We have hardened the system against network instability, user spam, and resource leaks.
+
+### Backend Hardening (FastAPI)
+- **Session Pooling**: Replaced per-request `aiohttp` sessions with a global singleton session.
+  - **Why**: Reduces TCP handshake overhead and socket churn.
+  - **Implementation**: `aiohttp.ClientSession` initialized on startup event, closed on shutdown.
+  - **SSL**: Supports `certifi` context by default, but allows development bypass via `LIVEKIT_INSECURE_SKIP_VERIFY=true`.
+- **Deduplication**: Implemented server-side dedupe for `/say` requests.
+  - **Logic**: Drops requests with identical `(room, text)` pairs within `SAY_DEDUPE_WINDOW_SEC` (default 1.5s).
+  - **Why**: Prevents double-speech when users aggressively retry or simultaneous events occur.
+- **Timeouts**: Enforced strict timeouts on upstream LiveKit API calls.
+  - **Logic**: `asyncio.wait_for` wraps LiveKit calls with `SAY_TIMEOUT_SEC`.
+  - **Why**: Prevents indefinite hanging if the LiveKit server is unreachable.
+- **Protocol Safety**: Added `wss://` -> `https://` protocol normalization helper to ensure LiveKit API client connectivity.
+
+### Frontend Hardening (Next.js)
+- **Client-Side Mutex**: Implemented a `speakLockRef` (ref-based mutex).
+  - **Why**: Prevents race conditions where a second request is sent while the first is satisfying a React state update.
+- **Input Guarding**:
+  - **Double-Click**: Ignored clicks within 250ms of the last action.
+  - **IME Composition**: Blocked `Enter` key send events while composing Korean/Japanese text.
+  - **Key Repeat**: Ignored operating system key repeat events for `Enter`.
+- **AbortController**: Implemented cancelable fetch requests.
+  - **Why**: Ensures cleaning up of "inflight" requests if the component unmounts or the user retries.
+
+### Verification / How to Test
+1. **Start Services**: `npm run dev` (Web), `python agent.py` (Agent), `uvicorn main:app` (API).
+2. **Join Room**: Connect via `localhost:3000`.
+3. **Spam Test**: Aggressively click "Speak" or mash `Enter`.
+   - **Backend Logs**: Should show only ONE `/say` request processed; subsequent may show deduplicated return.
+   - **Agent Logs**: Only ONE "Received data packet... say" log appears.
+   - **UI**: Button should disable immediately and stay disabled until the request completes/times out.
+4. **Health Check**: Verify `GET /health` returns `{"status": "ok"}`.
+
 ## Bug Fixes
 
 ### Fix: Last word cut off / speech truncation
